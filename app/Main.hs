@@ -59,15 +59,14 @@ main = do
       , tell = Nothing
       }
 
--- figure out IPC
-
+-- IPC?
 loop :: Σ -> IO ()
 loop st = do
-   -- wait for input (Inter Process Communication)
-   -- if input does something then update state and loop
-   -- verify if won
+   -- wait for input
+   -- update state
+   -- send message
+   -- loop st
    pure ()
--- loop st
 
    where
 
@@ -117,7 +116,7 @@ loop st = do
       u :: Hand -> Hand
       u h = h { picks = Nothing }
 
--- -- play vase if valid move
+   -- play vase if valid move
    play :: Σ
    play
       | Just h <- hand st !? turn st , Grid c <- focus h , Nothing <- top (focus h) = st' (focus h) c
@@ -177,15 +176,7 @@ loop st = do
    win
       | x:_ <- mapMaybe line (elems rows <> elems cols <> pure posd <> pure negd) = Just x
       | otherwise = Nothing
-
       where
-
-      line :: [Team] -> Maybe Team
-      line [] = Nothing
-      line (x:xs)
-         | all (x ==) xs = Just x
-         | otherwise = Nothing
-
       rows :: Map Word [Team]
       rows = map team . take 1 <$> mapKeysWith (<>) fst (tile st)
       cols :: Map Word [Team]
@@ -194,5 +185,8 @@ loop st = do
       posd = join . elems $ map team . take 1 <$> filterWithKey (\(x,y) _ -> x == y) (tile st)
       negd :: [Team]
       negd = join . elems $ map team . take 1 <$> filterWithKey (\(x,y) _ -> x == prev (scale (opts st) - y)) (tile st)
-
-
+      line :: [Team] -> Maybe Team
+      line [] = Nothing
+      line (x:xs)
+         | all (x ==) xs = Just x
+         | otherwise = Nothing
