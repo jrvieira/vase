@@ -1,8 +1,15 @@
 module Main where
 
-import Relude
-import Data.Map.Strict ( (!?), mapKeysWith, filterWithKey, elems, insert, update, adjust, keys )
+import Protolude
+import Data.Map.Strict ( (!?), mapKeysWith, filterWithKey, elems, insert, update, adjust, keys, fromList )
 import Zero
+
+import Network.Simple.TCP
+import Data.ByteString as BS ( toStrict )
+import Data.ByteString.Char8 ( unpack )
+import Data.Text ( pack )
+
+import Data.Aeson
 
 default ([], Word, Text)
 
@@ -15,12 +22,25 @@ data Σ = Σ
    , tell :: Maybe Text
    }
 
+data Msg = Msg
+   { msg_turn :: Team
+   , msg_tile :: Map Coord [Vase]
+   , msg_tell :: Maybe Text
+   , msg_focus :: Maybe Focus
+   , msg_picks :: Maybe Focus
+   } deriving Generic
+
+instance ToJSON Msg
+instance ToJSON Hand
+instance ToJSON Vase
+instance ToJSON Focus
+
 type Coord = (Word,Word)
 
 data Vase = Vase
    { team :: Team
    , rank :: Word
-   } deriving Eq
+   } deriving ( Eq, Generic )
 
 instance Ord Vase where
    compare = on compare rank
@@ -32,9 +52,10 @@ data Hand = Hand
    , lnest :: Word  -- last recorded focus on nest
    , ltile :: Coord  -- last recorded focus on tile
    , picks :: Maybe Focus  -- grabbed vase origin
-   }
+   } deriving Generic
 
 data Focus = Nest Word | Grid Coord
+   deriving Generic
 
 data Opts = Opts
    { teams :: Word
@@ -43,6 +64,15 @@ data Opts = Opts
    }
 
 data Dir = N | S | E | W | X
+
+dir :: Text -> Maybe Dir
+dir "N" = Just N
+dir "S" = Just S
+dir "E" = Just E
+dir "W" = Just W
+dir "X" = Just X
+dir  _  = Nothing
+
 data Act = Pick | Undo | Play
 
 main :: IO ()
@@ -50,34 +80,54 @@ main = do
    c :: Word <- pure 2  -- number of teams
    s :: Word <- pure 4  -- size of square and number of vase ranks
    p :: Word <- pure 3  -- number of piles in each player's nest
-   loop Σ
-      { tile = fromList $ [ ((x,y),[]) | x <- genericTake s total , y <- genericTake s total ]
-      , nest = fromList $ [ (n,genericReplicate p s) | n <- genericTake c total ]
+
+   serve (Host "127.0.0.1") "8500" $ \ (so,_) -> loop so Σ
+      { tile = fromList [ ((x,y),[]) | x <- genericTake s total , y <- genericTake s total ]
+      , nest = fromList [ (n,genericReplicate p s) | n <- genericTake c total ]
       , turn = 0
-      , hand = fromList $ [ (n,Hand { focus = Nest 0 , picks = Nothing , lnest = 0 , ltile = (prev $ div s 2,prev $ div s 2) }) | n <- genericTake c total ]
+      , hand = fromList [ (n,Hand { focus = Nest 0 , picks = Nothing , lnest = 0 , ltile = (prev $ div s 2,prev $ div s 2) }) | n <- genericTake c total ]
       , opts = Opts { teams = c , scale = s , piles = p }
       , tell = Nothing
       }
 
--- IPC?
-loop :: Σ -> IO ()
-loop st = do
-   -- wait for input
-   -- update state
-   -- send message
-   -- loop st
-   pure ()
+-- game allows 4 state altering actions
+   -- move Dir
+   -- pick
+   -- undo
+   -- play
 
+loop :: Socket -> Σ -> IO ()
+loop so st = do
+   send so $ BS.toStrict $ encode $ Msg
+      { msg_turn  = turn st
+      , msg_tile  = tile st
+      , msg_tell  = tell st
+      , msg_focus  = focus <$> hand st !? turn st
+      , msg_picks  = picks =<< hand st !? turn st
+      }
+   res <- recv so 128
+   case res of
+      Nothing -> print "connection closed"
+      Just msg -> loop so $ case words $ pack $ unpack msg of
+         ["move",x]
+            | Just d  <- dir x -> move d
+            | otherwise -> st { tell = Just $ unwords ["illegal move:",pack $ unpack msg] }
+         ["pick"] -> pick
+         ["undo"] -> undo
+         ["play"] -> play
+         _ -> st { tell = Just $ unwords ["illegal msg:",pack $ unpack msg] }
    where
 
    -- initial stack
    pile :: Team -> Word -> [Vase]
    pile s n = Vase s <$> [0..prev n]
 
+   -- ACTIONS
+
    -- move hand
    move :: Dir -> Σ
    move d
-      | Just h <- hand st !? turn st = st { hand = insert (turn st) (m h) (hand st) }
+      | Just h <- hand st !? turn st = st { hand = insert (turn st) (m h) (hand st) , tell = Nothing }
       | otherwise = st { tell = Just "error: no move" }
       where
       m :: Hand -> Hand
@@ -98,7 +148,7 @@ loop st = do
    -- pick vase to play
    pick :: Σ
    pick
-      | Just h <- hand st !? turn st = st { hand = insert (turn st) (p h) (hand st) }
+      | Just h <- hand st !? turn st = st { hand = insert (turn st) (p h) (hand st) , tell = Nothing }
       | otherwise = st { tell = Just "error: no pick" }
       where
       p :: Hand -> Hand
@@ -110,7 +160,7 @@ loop st = do
    -- drop grabbed vase
    undo :: Σ
    undo
-      | Just h <- hand st !? turn st = st { hand = insert (turn st) (u h) (hand st) }
+      | Just h <- hand st !? turn st = st { hand = insert (turn st) (u h) (hand st) , tell = Nothing }
       | otherwise = st -- no undo
       where
       u :: Hand -> Hand
@@ -119,22 +169,25 @@ loop st = do
    -- play vase if valid move
    play :: Σ
    play
-      | Just h <- hand st !? turn st , Grid c <- focus h , Nothing <- top (focus h) = st' (focus h) c
-      | Just h <- hand st !? turn st , Grid c <- focus h , Just (Grid _) <- picks h , caps = st' (focus h) c
-      | Just h <- hand st !? turn st , Grid c <- focus h , Just (Nest _) <- picks h , caps , rescue = st' (focus h) c
-      | otherwise = st  -- no play
+      | Just h <- hand st !? turn st , Grid f <- focus h , Just p <- picks h , Nothing <- top (focus h) = st' f p
+      | Just h <- hand st !? turn st , Grid f <- focus h , Just (Grid p) <- picks h , caps = st' f (Grid p)
+      | Just h <- hand st !? turn st , Grid f <- focus h , Just (Nest p) <- picks h , caps , rescue = st' f (Nest p)
+      | otherwise = st { tell = Just "no play" }
       where
-      st' f c = st
-         { tile = tile' f c
-         , nest = nest' f
+      st' f p = st
+         { tile = tile' f p
+         , nest = nest' p
          , turn = mod (succ $ turn st) (teams $ opts st)
+         , tell = Nothing
          }
-      tile' o t
-         | Grid c <- o = update (\x -> (: x) <$> top o) t . adjust (drop 1) c $ tile st
-         | Nest _ <- o = update (\x -> (: x) <$> top o) t $ tile st
-      nest' o
-         | Grid _ <- o = nest st
-         | Nest n <- o = adjust (nth n prev) (turn st) $ nest st
+      tile' f p
+         | Grid c <- p = update (\x -> (: x) <$> top p) f . adjust (drop 1) c $ tile st
+         | Nest _ <- p = update (\x -> (: x) <$> top p) f $ tile st
+      nest' p
+         | Grid _ <- p = nest st
+         | Nest n <- p = adjust (nth n prev) (turn st) $ nest st
+
+   --
 
    -- can the vase be placed
    caps :: Bool
